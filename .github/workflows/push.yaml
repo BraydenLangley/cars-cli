@@ -65,7 +65,9 @@ jobs:
         fi
     - name: Publish to npm
       if: steps.check-version.outputs.should_publish == 'true'
-      run: npm publish
+      env:
+        NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      run: npm publish --access public
     - name: Skip publishing
       if: steps.check-version.outputs.should_publish == 'false'
       run: echo "Skipping publish - version already exists on npm"
