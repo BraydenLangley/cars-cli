@@ -4,6 +4,7 @@ import fs from 'fs';
 import path from 'path';
 import axios from 'axios';
 import * as tar from 'tar';
+import dns from 'dns/promises';
 import { spawnSync } from 'child_process';
 import chalk from 'chalk';
 import inquirer from 'inquirer';
@@ -25,11 +26,7 @@ let authFetch = new AuthFetch(walletClient);
 
 const remakeWallet = async (key: HexString, network: WalletNetwork = 'mainnet', storage?: string) => {
   if (typeof storage !== 'string') {
-    if (network === 'mainnet') {
-      storage = 'https://storage.babbage.systems'
-    } else {
-      storage = 'https://staging-storage.babbage.systems'
-    }
+    storage = defaultStorageUrl(network);
   }
   const keyDeriver = new KeyDeriver(new PrivateKey(key, 'hex'));
   const storageManager = new WalletStorageManager(keyDeriver.identityKey);
@@ -126,9 +123,146 @@ const ARTIFACT_PREFIX = 'cars_artifact_';
 const ARTIFACT_EXTENSION = '.tgz';
 const VALID_LOG_PERIODS = ['5m', '15m', '30m', '1h', '2h', '6h', '12h', '1d', '2d', '7d'] as const;
 const VALID_LOG_LEVELS = ['all', 'error', 'warn', 'info'] as const;
+const DEFAULT_CARS_CLOUD_URL = 'https://cars.babbage.systems';
+const DEFAULT_MAINNET_STORAGE_URL = 'https://storage.babbage.systems';
+const DEFAULT_TESTNET_STORAGE_URL = 'https://staging-storage.babbage.systems';
+const REQUEST_TIMEOUT_MS = parsePositiveInt(process.env.CARS_REQUEST_TIMEOUT_MS, 120000);
+const PREFLIGHT_TIMEOUT_MS = parsePositiveInt(process.env.CARS_PREFLIGHT_TIMEOUT_MS, 15000);
+const RELEASE_UPLOAD_TIMEOUT_MS = parsePositiveInt(process.env.CARS_UPLOAD_TIMEOUT_MS, 15 * 60 * 1000);
+const REQUEST_RETRIES = parsePositiveInt(process.env.CARS_REQUEST_RETRIES, 3);
+const UPLOAD_RETRIES = parsePositiveInt(process.env.CARS_UPLOAD_RETRIES, 3);
+const TOPUP_CHUNK_SATS = parsePositiveInt(process.env.CARS_TOPUP_CHUNK_SATS, 10000);
 
 type LogPeriod = typeof VALID_LOG_PERIODS[number];
 type LogLevel = typeof VALID_LOG_LEVELS[number];
+
+type RetryOptions = {
+  attempts?: number;
+  timeoutMs?: number;
+  retryDelayMs?: number;
+};
+
+type CarsUploadResult = {
+  deploymentId?: string;
+  projectId?: string;
+  status?: number;
+  body?: any;
+};
+
+class CARSRequestError extends Error {
+  status?: number;
+  endpoint?: string;
+  body?: any;
+  retryable: boolean;
+
+  constructor(message: string, options: { status?: number; endpoint?: string; body?: any; retryable?: boolean } = {}) {
+    super(message);
+    this.name = 'CARSRequestError';
+    this.status = options.status;
+    this.endpoint = options.endpoint;
+    this.body = options.body;
+    this.retryable = Boolean(options.retryable);
+  }
+}
+
+function parsePositiveInt(value: string | undefined, fallback: number): number {
+  const parsed = value ? parseInt(value, 10) : NaN;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function sleep(ms: number) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function normalizeBaseUrl(rawUrl: string): string {
+  return rawUrl.replace(/\/+$/, '');
+}
+
+function defaultStorageUrl(network: WalletNetwork = 'mainnet') {
+  return network === 'mainnet' ? DEFAULT_MAINNET_STORAGE_URL : DEFAULT_TESTNET_STORAGE_URL;
+}
+
+function isRetryableStatus(status?: number) {
+  return status === 408 || status === 409 || status === 425 || status === 429 || (typeof status === 'number' && status >= 500);
+}
+
+function isRetryableError(error: any) {
+  if (error instanceof CARSRequestError) return error.retryable;
+  if (error?.response?.status) return isRetryableStatus(error.response.status);
+  const code = error?.code || error?.cause?.code;
+  return ['ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED', 'EAI_AGAIN', 'ENOTFOUND', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_SOCKET'].includes(code) ||
+    /timeout|fetch failed|network|socket|terminated/i.test(error?.message || '');
+}
+
+function formatError(error: any) {
+  if (error instanceof CARSRequestError) {
+    const status = error.status ? `HTTP ${error.status}` : 'network';
+    const body = error.body?.error || error.body?.message || (typeof error.body === 'string' ? error.body.slice(0, 300) : undefined);
+    return `${status}: ${body || error.message}`;
+  }
+  if (error?.response?.data?.error) return `HTTP ${error.response.status}: ${error.response.data.error}`;
+  if (error?.response?.status) return `HTTP ${error.response.status}: ${JSON.stringify(error.response.data).slice(0, 300)}`;
+  if (error?.message) return error.message;
+  return 'An unknown error occurred.';
+}
+
+async function parseFetchResponse(response: any) {
+  const text = await response.text();
+  if (!text) return undefined;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+}
+
+async function authFetchJson<T = any>(
+  client: AuthFetch,
+  url: string,
+  init: any,
+  contextMsg: string,
+  retryOptions: RetryOptions = {}
+): Promise<T> {
+  const attempts = retryOptions.attempts || REQUEST_RETRIES;
+  const timeoutMs = retryOptions.timeoutMs || REQUEST_TIMEOUT_MS;
+  const retryDelayMs = retryOptions.retryDelayMs || 2000;
+  let lastError: any;
+
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await client.fetch(url, { ...init, signal: controller.signal });
+      const body = await parseFetchResponse(response);
+      if (!response.ok) {
+        throw new CARSRequestError(`${contextMsg} failed`, {
+          status: response.status,
+          endpoint: url,
+          body,
+          retryable: isRetryableStatus(response.status)
+        });
+      }
+      return body as T;
+    } catch (error: any) {
+      lastError = error?.name === 'AbortError'
+        ? new CARSRequestError(`${contextMsg} timed out after ${timeoutMs}ms`, { endpoint: url, retryable: true })
+        : error;
+      if (attempt >= attempts || !isRetryableError(lastError)) break;
+      console.error(chalk.yellow(`Transient CARS request failure (${attempt}/${attempts}) for ${url}: ${formatError(lastError)}`));
+      await sleep(retryDelayMs * attempt);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  throw lastError;
+}
+
+function extractData<T = any>(response: any): T {
+  return (response && typeof response === 'object' && 'data' in response && response.data && typeof response.data === 'object')
+    ? response.data as T
+    : response as T;
+}
 
 function isValidLogPeriod(period: string): period is LogPeriod {
   return VALID_LOG_PERIODS.includes(period as LogPeriod);
@@ -248,19 +382,19 @@ async function ensureRegistered(carsConfig: CARSConfig) {
     console.error(chalk.red('❌ No CARS Cloud URL set in the chosen configuration.'));
     process.exit(1);
   }
-  if (registrations[carsConfig.CARSCloudURL]) {
+  const baseUrl = normalizeBaseUrl(carsConfig.CARSCloudURL);
+  if (registrations[baseUrl]) {
     return
   }
   try {
-    const response = await authFetch.fetch(`${carsConfig.CARSCloudURL}/api/v1/register`, {
+    await authFetchJson(authFetch, `${baseUrl}/api/v1/register`, {
       method: 'POST',
       headers: {
         'content-type': 'application/json'
       },
       body: '{}'
-    });
-    await response.json()
-    registrations[carsConfig.CARSCloudURL] = true
+    }, 'Registration');
+    registrations[baseUrl] = true
   } catch (error: any) {
     handleRequestError(error, 'Registration failed');
     process.exit(1);
@@ -300,14 +434,7 @@ async function chooseOrCreateProjectID(cloudUrl: string, currentProjectID?: stri
 
     let projects: { projects: ProjectListing[] };
     try {
-      let response = await authFetch.fetch(`${cloudUrl}/api/v1/project/list`, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json'
-        },
-        body: '{}'
-      });
-      projects = await response.json();
+      projects = await requiredRequest<{ projects: ProjectListing[] }>(authFetch, cloudUrl, '/api/v1/project/list', {}, 'List projects');
     } catch (error: any) {
       handleRequestError(error, 'Failed to retrieve projects from CARS Cloud.');
       process.exit(1);
@@ -337,14 +464,7 @@ async function chooseOrCreateProjectID(cloudUrl: string, currentProjectID?: stri
     // Create new project
     let result: any;
     try {
-      result = await authFetch.fetch(`${cloudUrl}/api/v1/project/create`, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json'
-        },
-        body: JSON.stringify({ name, network })
-      });
-      result = await result.json()
+      result = await requiredRequest(authFetch, cloudUrl, '/api/v1/project/create', { name, network }, 'Create project');
     } catch (error: any) {
       handleRequestError(error, 'Failed to create new project.');
       process.exit(1);
@@ -727,18 +847,27 @@ function findLatestArtifact(): string {
 
 async function safeRequest<T = any>(client: AuthFetch, baseUrl: string, endpoint: string, data: any): Promise<T | undefined> {
   try {
-    const response = await client.fetch(`${baseUrl}${endpoint}`, {
+    return await authFetchJson<T>(client, `${normalizeBaseUrl(baseUrl)}${endpoint}`, {
       method: 'POST',
       headers: {
         'content-type': 'application/json'
       },
       body: JSON.stringify(data)
-    });
-    return await response.json()
+    }, `Request to ${endpoint}`);
   } catch (error: any) {
     handleRequestError(error, `Request to ${endpoint} failed`);
     return undefined;
   }
+}
+
+async function requiredRequest<T = any>(client: AuthFetch, baseUrl: string, endpoint: string, data: any, contextMsg?: string): Promise<T> {
+  return await authFetchJson<T>(client, `${normalizeBaseUrl(baseUrl)}${endpoint}`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json'
+    },
+    body: JSON.stringify(data)
+  }, contextMsg || `Request to ${endpoint}`);
 }
 
 /**
@@ -746,13 +875,7 @@ async function safeRequest<T = any>(client: AuthFetch, baseUrl: string, endpoint
  */
 function handleRequestError(error: any, contextMsg?: string) {
   if (contextMsg) console.error(chalk.red(`❌ ${contextMsg}`));
-  if (error?.response?.data?.error) {
-    console.error(chalk.red(`Error from server: ${error.response.data.error}`));
-  } else if (error.message) {
-    console.error(chalk.red(`Error: ${error.message}`));
-  } else {
-    console.error(chalk.red('An unknown error occurred.'));
-  }
+  console.error(chalk.red(`Error: ${formatError(error)}`));
 }
 
 /**
@@ -1020,19 +1143,13 @@ async function setCustomDomain(config: CARSConfig, domainType: 'frontend' | 'bac
   let retry = true;
   while (retry) {
     try {
-      let result: any = await client.fetch(`${config.CARSCloudURL}/api/v1/project/${config.projectID}/domains/${domainType}`, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json'
-        },
-        body: JSON.stringify({ domain })
-      });
-      result = await result.json()
-      if (result && result.domain) {
+      const result: any = await requiredRequest(client, config.CARSCloudURL, `/api/v1/project/${config.projectID}/domains/${domainType}`, { domain }, 'Domain verification');
+      const domainResult = extractData<{ domain?: string }>(result);
+      if (domainResult && domainResult.domain) {
         console.log(chalk.green(`✅ ${domainType.charAt(0).toUpperCase() + domainType.slice(1)} custom domain set successfully.`));
         return;
       } else {
-        throw new Error('No domain in response.');
+        throw new Error(`No domain in response. Response keys: ${Object.keys(result || {}).join(', ') || 'none'}`);
       }
     } catch (error: any) {
       if (!interactive) {
@@ -1240,11 +1357,37 @@ async function topUpProjectBalance(config: CARSConfig) {
     { type: 'number', name: 'amount', message: 'Enter amount in satoshis to add:', validate: (val: number) => val > 0 ? true : 'Amount must be positive.' }
   ]);
 
-  const client = await buildAuthFetch(config);
-  const result = await safeRequest(client, config.CARSCloudURL, `/api/v1/project/${config.projectID}/pay`, { amount });
-  if (result) {
-    console.log(chalk.green(`✅ Balance topped up by ${amount} sats.`));
+  await topUpProjectBalanceByAmount(config, amount);
+}
+
+async function getTopUpChunkSize(client: AuthFetch, config: CARSConfig): Promise<number> {
+  if (!config.projectID) return TOPUP_CHUNK_SATS;
+  const quote = await safeRequest<any>(client, config.CARSCloudURL, `/api/v1/project/${config.projectID}/pay/quote`, {});
+  const data = extractData<any>(quote);
+  const maxAmount = parsePositiveInt(String(data?.maxAmount || ''), TOPUP_CHUNK_SATS);
+  return Math.max(1, Math.min(maxAmount, TOPUP_CHUNK_SATS));
+}
+
+async function topUpProjectBalanceByAmount(config: CARSConfig, amount: number) {
+  if (!config.projectID) {
+    console.error(chalk.red('❌ No project ID set.'));
+    process.exit(1);
   }
+  const client = await buildAuthFetch(config);
+  const chunkSize = await getTopUpChunkSize(client, config);
+  let remaining = amount;
+  let credited = 0;
+
+  while (remaining > 0) {
+    const chunk = Math.min(remaining, chunkSize);
+    const result = await requiredRequest<any>(client, config.CARSCloudURL, `/api/v1/project/${config.projectID}/pay`, { amount: chunk }, `Top up ${chunk} sats`);
+    const data = extractData<any>(result);
+    credited += Number(data?.amount || chunk);
+    remaining -= chunk;
+    console.log(chalk.green(`✅ Credited ${chunk} sats (${credited}/${amount}).`));
+  }
+
+  console.log(chalk.green(`✅ Balance topped up by ${credited} sats.`));
 }
 
 /**
@@ -1367,6 +1510,14 @@ on:
   push:
     branches:
       - ${branch.trim()}
+  workflow_dispatch:
+
+concurrency:
+  group: cars-deploy-${config.projectID}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -1387,8 +1538,45 @@ jobs:
       - name: Build artifact
         run: cars build ${configIndex}
 
+      - name: Check CARS transport
+        env:
+          CARS_WALLET_STORAGE: \${{ secrets.CARS_WALLET_STORAGE }}
+        run: |
+          set -euo pipefail
+          storage_args=()
+          if [ -n "\${CARS_WALLET_STORAGE:-}" ]; then
+            storage_args=(--storage "\$CARS_WALLET_STORAGE")
+          fi
+          cars doctor ${configIndex} "\${storage_args[@]}"
+
       - name: Release artifact
-        run: cars release now ${configIndex} --key "\${{ secrets.CARS_PRIVATE_KEY }}"
+        env:
+          CARS_PRIVATE_KEY: \${{ secrets.CARS_PRIVATE_KEY }}
+          CARS_WALLET_STORAGE: \${{ secrets.CARS_WALLET_STORAGE }}
+        run: |
+          set -euo pipefail
+          if [ -z "\${CARS_PRIVATE_KEY:-}" ]; then
+            echo "CARS_PRIVATE_KEY repository secret is required." >&2
+            exit 1
+          fi
+
+          storage_args=()
+          if [ -n "\${CARS_WALLET_STORAGE:-}" ]; then
+            storage_args=(--storage "\$CARS_WALLET_STORAGE")
+          fi
+
+          for attempt in 1 2 3; do
+            log_file="cars-release-attempt-\${attempt}.log"
+            if cars release now ${configIndex} --key "\$CARS_PRIVATE_KEY" --network ${config.network || 'mainnet'} "\${storage_args[@]}" 2>&1 | tee "\$log_file"; then
+              grep -q "CARS_RELEASE_SUCCESS" "\$log_file"
+              exit 0
+            fi
+            status=\${PIPESTATUS[0]}
+            if [ "\$attempt" -eq 3 ]; then
+              exit "\$status"
+            fi
+            sleep "\$((attempt * 20))"
+          done
 `;
 
   console.log(chalk.greenBright('\n--- GitHub Actions Setup Instructions ---'));
@@ -1464,6 +1652,51 @@ async function showGlobalPublicInfo() {
     spinner.fail('❌ Failed to fetch public info.');
     handleRequestError(error);
   }
+}
+
+async function httpProbe(label: string, method: 'GET' | 'POST' | 'HEAD', url: string, requireSuccess: boolean) {
+  try {
+    const response = await axios.request({
+      method,
+      url,
+      data: method === 'POST' ? {} : undefined,
+      timeout: PREFLIGHT_TIMEOUT_MS,
+      validateStatus: status => requireSuccess ? status >= 200 && status < 300 : status < 600
+    });
+    console.log(chalk.green(`✅ ${label}: HTTP ${response.status}`));
+    return response;
+  } catch (error: any) {
+    throw new CARSRequestError(`${label} probe failed: ${formatError(error)}`, {
+      status: error?.response?.status,
+      endpoint: url,
+      body: error?.response?.data,
+      retryable: isRetryableError(error)
+    });
+  }
+}
+
+async function dnsProbe(label: string, host: string) {
+  const records = await dns.lookup(host, { all: true });
+  if (!records.length) {
+    throw new Error(`${label}: no DNS records found for ${host}`);
+  }
+  console.log(chalk.green(`✅ ${label}: ${host} -> ${records.map(r => r.address).join(', ')}`));
+}
+
+async function runCARSPreflight(config?: CARSConfig, explicitCloudUrl?: string, explicitStorageUrl?: string) {
+  const cloudUrl = normalizeBaseUrl(explicitCloudUrl || config?.CARSCloudURL || DEFAULT_CARS_CLOUD_URL);
+  const storageUrl = normalizeBaseUrl(explicitStorageUrl || defaultStorageUrl((config?.network as WalletNetwork) || 'mainnet'));
+  const cloudHost = new URL(cloudUrl).hostname;
+  const storageHost = new URL(storageUrl).hostname;
+
+  console.log(chalk.blue(`CARS preflight: ${cloudUrl}`));
+  await dnsProbe('CARS DNS', cloudHost);
+  await dnsProbe('Wallet storage DNS', storageHost);
+  await httpProbe('CARS live health', 'GET', `${cloudUrl}/health/live`, true);
+  await httpProbe('CARS public API', 'GET', `${cloudUrl}/api/v1/public`, true);
+  await httpProbe('CARS auth endpoint transport', 'POST', `${cloudUrl}/.well-known/auth`, false);
+  await httpProbe('Wallet storage transport', 'GET', storageUrl, false);
+  console.log(chalk.green('✅ CARS preflight passed.'));
 }
 
 // Interactive editing for advanced engine config
@@ -2019,10 +2252,15 @@ async function releaseMenu() {
         continue;
       }
       const client = await buildAuthFetch(config);
-      const result = await safeRequest<{ url: string, deploymentId: string }>(client, config.CARSCloudURL, `/api/v1/project/${config.projectID}/deploy`, {});
-      if (result && result.url && result.deploymentId) {
-        console.log(chalk.green(`✅ Release created. Release ID: ${result.deploymentId}`));
-        console.log(`Upload URL: ${result.url}`);
+      try {
+        const result = await requiredRequest<{ url?: string, deploymentId?: string }>(client, config.CARSCloudURL, `/api/v1/project/${config.projectID}/deploy`, {}, 'Create deployment');
+        const deploy = extractData<{ url?: string, deploymentId?: string }>(result);
+        if (deploy?.url && deploy?.deploymentId) {
+          console.log(chalk.green(`✅ Release created. Release ID: ${deploy.deploymentId}`));
+          console.log(`Upload URL: ${deploy.url}`);
+        }
+      } catch (error) {
+        handleRequestError(error, 'Failed to create release');
       }
     } else if (action === 'upload-files') {
       const { uploadURL } = await inquirer.prompt([
@@ -2068,13 +2306,7 @@ async function releaseMenu() {
         console.error(chalk.red('❌ No project ID set.'));
         continue;
       }
-
-      const artifactPath = findLatestArtifact();
-      const client = await buildAuthFetch(config);
-      const result = await safeRequest<{ url: string, deploymentId: string }>(client, config.CARSCloudURL, `/api/v1/project/${config.projectID}/deploy`, {});
-      if (result && result.url && result.deploymentId) {
-        await uploadArtifact(result.url, artifactPath);
-      }
+      await releaseLatestArtifact(config).catch(error => handleRequestError(error, 'Release failed'));
     } else {
       done = true;
     }
@@ -2130,24 +2362,64 @@ async function artifactMenu() {
  * @param artifactPath The path to the artifact file
  * 
  */
-async function uploadArtifact(uploadURL: string, artifactPath: string) {
+async function uploadArtifact(uploadURL: string, artifactPath: string): Promise<CarsUploadResult> {
   if (!fs.existsSync(artifactPath)) {
-    console.error(chalk.red(`❌ Artifact not found: ${artifactPath}`));
-    return;
+    throw new Error(`Artifact not found: ${artifactPath}`);
   }
   const spinner = ora('Uploading artifact...').start();
-  const artifactData = fs.readFileSync(artifactPath);
-  try {
-    await axios.post(uploadURL, artifactData, {
-      headers: {
-        'content-type': 'application/octet-stream'
-      },
-    });
-    spinner.succeed('✅ Artifact uploaded successfully.');
-  } catch (error: any) {
-    spinner.fail('❌ Artifact upload failed.');
-    handleRequestError(error);
+  const artifactSize = fs.statSync(artifactPath).size;
+  let lastError: any;
+
+  for (let attempt = 1; attempt <= UPLOAD_RETRIES; attempt++) {
+    try {
+      const response = await axios.post(uploadURL, fs.createReadStream(artifactPath), {
+        headers: {
+          'content-type': 'application/octet-stream',
+          'content-length': artifactSize
+        },
+        maxBodyLength: Infinity,
+        maxContentLength: Infinity,
+        timeout: RELEASE_UPLOAD_TIMEOUT_MS,
+        validateStatus: status => status >= 200 && status < 300
+      });
+      spinner.succeed(`✅ Artifact uploaded successfully (${artifactSize} bytes).`);
+      return { status: response.status, body: response.data, deploymentId: response.data?.deploymentId, projectId: response.data?.projectId };
+    } catch (error: any) {
+      lastError = error;
+      if (attempt >= UPLOAD_RETRIES || !isRetryableError(error)) break;
+      spinner.text = `Artifact upload attempt ${attempt} failed; retrying...`;
+      await sleep(3000 * attempt);
+    }
   }
+
+  spinner.fail('❌ Artifact upload failed.');
+  handleRequestError(lastError);
+  throw lastError;
+}
+
+async function releaseLatestArtifact(config: CARSConfig): Promise<CarsUploadResult> {
+  if (!config.projectID) {
+    throw new Error('No project ID set.');
+  }
+  const artifactPath = findLatestArtifact();
+  const client = await buildAuthFetch(config);
+  const result = await requiredRequest<{ url?: string; deploymentId?: string; data?: any }>(
+    client,
+    config.CARSCloudURL,
+    `/api/v1/project/${config.projectID}/deploy`,
+    {},
+    'Create deployment'
+  );
+  const deploy = extractData<{ url?: string; deploymentId?: string }>(result);
+  if (!deploy?.url || !deploy?.deploymentId) {
+    throw new Error(`CARS deploy response did not include url and deploymentId. Response keys: ${Object.keys(result || {}).join(', ') || 'none'}`);
+  }
+
+  const upload = await uploadArtifact(deploy.url, artifactPath);
+  const deploymentId = upload.deploymentId || deploy.deploymentId;
+  console.log(chalk.green(`✅ CARS release accepted. Deployment ID: ${deploymentId}`));
+  console.log(`CARS_RELEASE_SUCCESS deploymentId=${deploymentId}`);
+  return { ...upload, deploymentId };
 }
 
 /**
@@ -2657,13 +2929,7 @@ projectCommand
       amount = answers.amount;
     }
 
-    const client = await buildAuthFetch(cfg);
-
-    // TODO: ACTUALLY IMPLEMENT PAYMENT
-    const result = await safeRequest(client, cfg.CARSCloudURL, `/api/v1/project/${cfg.projectID}/pay`, { amount });
-    if (result) {
-      console.log(chalk.green(`✅ Balance topped up by ${amount} sats.`));
-    }
+    await topUpProjectBalanceByAmount(cfg, amount);
   });
 
 // Delete project
@@ -2736,10 +3002,18 @@ releaseCommand
       process.exit(1);
     }
     const client = await buildAuthFetch(cfg);
-    const result = await safeRequest<{ url: string, deploymentId: string }>(client, cfg.CARSCloudURL, `/api/v1/project/${cfg.projectID}/deploy`, {});
-    if (result && result.url && result.deploymentId) {
-      console.log(chalk.green(`✅ Release created. Release ID: ${result.deploymentId}`));
-      console.log(`Upload URL: ${result.url}`);
+    try {
+      const result = await requiredRequest<{ url?: string, deploymentId?: string }>(client, cfg.CARSCloudURL, `/api/v1/project/${cfg.projectID}/deploy`, {}, 'Create deployment');
+      const deploy = extractData<{ url?: string, deploymentId?: string }>(result);
+      if (deploy?.url && deploy?.deploymentId) {
+        console.log(chalk.green(`✅ Release created. Release ID: ${deploy.deploymentId}`));
+        console.log(`Upload URL: ${deploy.url}`);
+      } else {
+        throw new Error('CARS deploy response did not include url and deploymentId.');
+      }
+    } catch (error) {
+      handleRequestError(error, 'Failed to create release');
+      process.exit(1);
     }
   });
 
@@ -2754,7 +3028,11 @@ releaseCommand
     if (options.key) {
       await remakeWallet(options.key, options.network, options.storage)
     }
-    await uploadArtifact(uploadURL, artifactPath);
+    try {
+      await uploadArtifact(uploadURL, artifactPath);
+    } catch (error) {
+      process.exit(1);
+    }
   });
 
 // View logs of a release
@@ -2802,11 +3080,11 @@ releaseCommand
       process.exit(1);
     }
 
-    const artifactPath = findLatestArtifact();
-    const client = await buildAuthFetch(cfg);
-    const result = await safeRequest<{ url: string, deploymentId: string }>(client, cfg.CARSCloudURL, `/api/v1/project/${cfg.projectID}/deploy`, {});
-    if (result && result.url && result.deploymentId) {
-      await uploadArtifact(result.url, artifactPath);
+    try {
+      await releaseLatestArtifact(cfg);
+    } catch (error) {
+      handleRequestError(error, 'Release failed');
+      process.exit(1);
     }
   });
 
@@ -2857,6 +3135,30 @@ artifactCommand.action(async () => {
 });
 
 // Global public info
+program
+  .command('doctor [nameOrIndex]')
+  .description('Run CARS DNS, health, auth transport, and wallet storage preflight checks')
+  .option('--cloud-url <url>', 'CARS Cloud URL to check without reading deployment-info.json')
+  .option('--storage <storage>', 'Wallet storage URL to check')
+  .option('--key <key>', 'Private key to use with CARS')
+  .option('--network <network>', 'Network to use with CARS')
+  .action(async (nameOrIndex, options) => {
+    try {
+      if (options.key) {
+        await remakeWallet(options.key, options.network, options.storage);
+      }
+      let cfg: CARSConfig | undefined;
+      if (!options.cloudUrl && fs.existsSync(CONFIG_PATH)) {
+        const info = loadCARSConfigInfo();
+        cfg = await pickCARSConfig(info, nameOrIndex);
+      }
+      await runCARSPreflight(cfg, options.cloudUrl, options.storage);
+    } catch (error) {
+      handleRequestError(error, 'CARS preflight failed');
+      process.exit(1);
+    }
+  });
+
 program
   .command('global-info [nameOrIndex]')
   .description('View global public info (public keys, pricing, etc.) from a chosen CARS Cloud')
