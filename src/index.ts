@@ -1533,7 +1533,7 @@ jobs:
           node-version: 22
 
       - name: Install CARS globally
-        run: npm i -g @bsv/cars-cli@latest
+        run: npm i -g @p2ppsr/cars-cli@latest
 
       - name: Build artifact
         run: cars build ${configIndex}

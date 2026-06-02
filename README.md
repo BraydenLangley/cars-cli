@@ -28,7 +28,7 @@ CARS enables you to:
 Install the CARS CLI globally:
 
 ```bash
-npm install -g @bsv/cars-cli
+npm install -g @p2ppsr/cars-cli
 ```
 
 Once installed, the `cars` command is available system-wide.
